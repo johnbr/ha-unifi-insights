@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from http import HTTPStatus
+from typing import Any, ClassVar
 
 import aiohttp
 
 from ..auth import ApiKeyAuth, LocalAuth
-from ..base import BaseUniFiClient
+from ..base import BaseUniFiClient, parse_retry_after
 from ..const import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_TIMEOUT,
     PROTECT_API_BASE_URL,
     PROTECT_INTEGRATION_PATH,
+    PROTECT_RATE_LIMIT_REQUESTS,
+    PROTECT_RATE_LIMIT_WINDOW,
     ConnectionType,
 )
 from ..exceptions import UniFiConnectionError, UniFiTimeoutError
@@ -86,6 +89,11 @@ class UniFiProtectClient(BaseUniFiClient):
             )
         ```
     """
+
+    RATE_LIMIT: ClassVar[tuple[int, float] | None] = (
+        PROTECT_RATE_LIMIT_REQUESTS,
+        PROTECT_RATE_LIMIT_WINDOW,
+    )
 
     def __init__(
         self,
@@ -371,6 +379,7 @@ class UniFiProtectClient(BaseUniFiClient):
             UniFiTimeoutError: If request times out.
 
         """
+        await self._throttle()
         session = await self._ensure_session()
         url = self._build_url(path)
         headers = self._get_headers()
@@ -385,6 +394,12 @@ class UniFiProtectClient(BaseUniFiClient):
                 headers=headers,
             ) as response:
                 if response.status >= 400:
+                    if response.status == HTTPStatus.TOO_MANY_REQUESTS:
+                        # Snapshots share the JSON calls' allowance: make the
+                        # whole client back off, not just this request.
+                        self._defer_after_rate_limit(
+                            parse_retry_after(response.headers)
+                        )
                     text = await response.text()
                     raise UniFiConnectionError(
                         f"Failed to fetch binary data: {response.status} - {text}"

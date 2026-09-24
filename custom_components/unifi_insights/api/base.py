@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from http import HTTPStatus
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 import aiohttp
 from yarl import URL
@@ -21,6 +24,8 @@ from .const import (
     HEADER_ACCEPT,
     HEADER_CONTENT_TYPE,
     HEADER_USER_AGENT,
+    RATE_LIMIT_MAX_RETRY_AFTER,
+    RATE_LIMIT_WINDOW_MARGIN,
     USER_AGENT,
 )
 from .exceptions import (
@@ -49,12 +54,69 @@ def _redact(text: str) -> str:
     )
 
 
+def parse_retry_after(headers: Mapping[str, str]) -> int:
+    """
+    Return a 429 response's Retry-After in seconds.
+
+    Falls back to DEFAULT_RATE_LIMIT_RETRY_AFTER when the header is missing
+    or is not a plain number of seconds (RFC 9110 also allows an HTTP date).
+    """
+    value = headers.get("Retry-After")
+    try:
+        return int(value) if value else DEFAULT_RATE_LIMIT_RETRY_AFTER
+    except ValueError:
+        return DEFAULT_RATE_LIMIT_RETRY_AFTER
+
+
+class RequestRateLimiter:
+    """
+    Space out requests so a client never exceeds a server-side rate limit.
+
+    Allows at most `max_requests` request starts in any rolling `window`
+    seconds. A rolling window is at least as strict as the server's fixed
+    one, so staying inside it can never trip a fixed-window limit. Waiters
+    are served in arrival order.
+    """
+
+    def __init__(self, max_requests: int, window: float) -> None:
+        """Initialize the limiter."""
+        self._max_requests = max_requests
+        self._window = window
+        self._starts: list[float] = []
+        self._blocked_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Wait until another request may start, then record it."""
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                cutoff = now - self._window
+                self._starts = [t for t in self._starts if t > cutoff]
+                if now < self._blocked_until:
+                    wait = self._blocked_until - now
+                elif len(self._starts) < self._max_requests:
+                    self._starts.append(now)
+                    return
+                else:
+                    wait = self._starts[0] - cutoff
+                await asyncio.sleep(wait)
+
+    def defer(self, seconds: float) -> None:
+        """Hold every request for `seconds`, e.g. after a server 429."""
+        self._blocked_until = max(self._blocked_until, time.monotonic() + seconds)
+
+
 class BaseUniFiClient(ABC):
     """
     Base async client for UniFi API interactions.
 
     This class provides common functionality for both Network and Protect APIs.
     """
+
+    # (max requests, window seconds) the server enforces, or None if the
+    # API is not rate limited. Subclasses set this; see `_throttle`.
+    RATE_LIMIT: ClassVar[tuple[int, float] | None] = None
 
     def __init__(
         self,
@@ -85,6 +147,12 @@ class BaseUniFiClient(ABC):
             connect=connect_timeout,
         )
         self._closed = False
+        self._rate_limiter: RequestRateLimiter | None = None
+        if self.RATE_LIMIT is not None:
+            max_requests, window = self.RATE_LIMIT
+            self._rate_limiter = RequestRateLimiter(
+                max_requests, window + RATE_LIMIT_WINDOW_MARGIN
+            )
 
     @property
     def base_url(self) -> URL:
@@ -156,6 +224,21 @@ class BaseUniFiClient(ABC):
         """
         return self._base_url / path.lstrip("/")
 
+    async def _throttle(self) -> None:
+        """Wait for the client's rate limiter, if the API has one."""
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire()
+
+    def _defer_after_rate_limit(self, retry_after: float) -> None:
+        """
+        Hold all of this client's requests after the server sent a 429.
+
+        Capped at RATE_LIMIT_MAX_RETRY_AFTER: a missing Retry-After defaults
+        to a minute, which must not freeze every request on the client.
+        """
+        if self._rate_limiter is not None:
+            self._rate_limiter.defer(min(retry_after, RATE_LIMIT_MAX_RETRY_AFTER))
+
     async def _request(
         self,
         method: str,
@@ -166,7 +249,50 @@ class BaseUniFiClient(ABC):
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | list[Any] | None:
         """
-        Make an HTTP request to the API.
+        Make an HTTP request, retrying once after a short-lived 429.
+
+        Rate-limited APIs are paced by `_throttle`, so a 429 means another
+        consumer of the same API key drained the allowance. A rejected
+        request was not processed, so retrying it once after the server's
+        own Retry-After is safe for every method. A long or missing
+        Retry-After is raised to the caller unchanged.
+
+        Raises:
+            UniFiRateLimitError: If still rate limited after the retry, or the
+                server asks for a wait longer than RATE_LIMIT_MAX_RETRY_AFTER.
+
+        """
+        try:
+            return await self._request_once(
+                method, path, params=params, json_data=json_data, headers=headers
+            )
+        except UniFiRateLimitError as err:
+            retry_after = err.retry_after
+            if (
+                self._rate_limiter is None
+                or retry_after is None
+                or retry_after > RATE_LIMIT_MAX_RETRY_AFTER
+            ):
+                raise
+            _LOGGER.debug(
+                "Rate limited on %s %s, retrying in %ss", method, path, retry_after
+            )
+            self._defer_after_rate_limit(retry_after)
+        return await self._request_once(
+            method, path, params=params, json_data=json_data, headers=headers
+        )
+
+    async def _request_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any] | list[Any] | None:
+        """
+        Make a single HTTP request to the API.
 
         Args:
             method: HTTP method.
@@ -187,6 +313,7 @@ class BaseUniFiClient(ABC):
             UniFiTimeoutError: If request times out.
 
         """
+        await self._throttle()
         session = await self._ensure_session()
         url = self._build_url(path)
 
@@ -270,14 +397,11 @@ class BaseUniFiClient(ABC):
             )
 
         if status == HTTPStatus.TOO_MANY_REQUESTS:
-            retry_after = response.headers.get("Retry-After")
             raise UniFiRateLimitError(
                 "Rate limited by API",
                 status_code=status,
                 response_body=response_text,
-                retry_after=int(retry_after)
-                if retry_after
-                else DEFAULT_RATE_LIMIT_RETRY_AFTER,
+                retry_after=parse_retry_after(response.headers),
             )
 
         if status >= HTTPStatus.BAD_REQUEST:

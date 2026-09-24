@@ -60,6 +60,21 @@ DEFAULT_CONNECT_TIMEOUT: Final[int] = 10
 # Rate limiting
 DEFAULT_RATE_LIMIT_RETRY_AFTER: Final[int] = 60
 
+# The local Protect Integration API allows 10 requests per fixed 1-second
+# window per API key, and advertises it on every response
+# (`RateLimit-Policy: "10-in-1sec"; q=10; w=1`). A 429 carries
+# `Retry-After: 1`. The Network Integration API sends no rate-limit headers
+# and its requests do not draw from the Protect allowance.
+PROTECT_RATE_LIMIT_REQUESTS: Final[int] = 10
+PROTECT_RATE_LIMIT_WINDOW: Final[float] = 1.0
+# Added to the window on the client side so request-arrival jitter cannot
+# land an 11th request inside one of the server's fixed windows.
+RATE_LIMIT_WINDOW_MARGIN: Final[float] = 0.1
+# A 429 is retried once after its Retry-After only when the server asks for a
+# short wait; a longer (or missing, i.e. defaulted) Retry-After is raised to
+# the caller as before, so a request never blocks for a minute.
+RATE_LIMIT_MAX_RETRY_AFTER: Final[int] = 5
+
 # User agent - uses version from single source of truth
 USER_AGENT: Final[str] = f"unifi-official-api/{__version__}"
 
