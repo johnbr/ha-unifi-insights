@@ -7,10 +7,9 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from http import HTTPStatus
 from types import TracebackType
-from typing import Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
 import aiohttp
 from yarl import URL
@@ -37,7 +36,12 @@ from .exceptions import (
     UniFiTimeoutError,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
+
 _LOGGER = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _SENSITIVE_KEYS_RE = re.compile(
     r'"(?:password|psk|passphrase|token|apiKey|api_key|secret|credential|'
@@ -229,7 +233,7 @@ class BaseUniFiClient(ABC):
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire()
 
-    def _defer_after_rate_limit(self, retry_after: float) -> None:
+    def _defer_after_rate_limit(self, retry_after: float | None) -> None:
         """
         Hold all of this client's requests after the server sent a 429.
 
@@ -237,7 +241,49 @@ class BaseUniFiClient(ABC):
         to a minute, which must not freeze every request on the client.
         """
         if self._rate_limiter is not None:
+            if retry_after is None:
+                retry_after = RATE_LIMIT_MAX_RETRY_AFTER
             self._rate_limiter.defer(min(retry_after, RATE_LIMIT_MAX_RETRY_AFTER))
+
+    async def _retry_once_after_rate_limit(
+        self,
+        send: Callable[[], Awaitable[_T]],
+        description: str,
+    ) -> _T:
+        """
+        Run `send`, retrying it once after a short-lived 429.
+
+        Rate-limited APIs are paced by `_throttle`, so a 429 means another
+        consumer of the same API key drained the allowance. A rejected
+        request was not processed, so retrying it once after the server's
+        own Retry-After is safe for every method. Every 429, including one
+        on the retry, holds the client's other requests for the (capped)
+        Retry-After, so they do not run into the allowance the server has
+        just refused. A long or missing Retry-After is raised to the caller
+        without a retry.
+
+        Raises:
+            UniFiRateLimitError: If still rate limited after the retry, or the
+                server asks for a wait longer than RATE_LIMIT_MAX_RETRY_AFTER.
+
+        """
+        if self._rate_limiter is None:
+            return await send()
+        try:
+            return await send()
+        except UniFiRateLimitError as err:
+            retry_after = err.retry_after
+            self._defer_after_rate_limit(retry_after)
+            if retry_after is None or retry_after > RATE_LIMIT_MAX_RETRY_AFTER:
+                raise
+            _LOGGER.debug(
+                "Rate limited on %s, retrying in %ss", description, retry_after
+            )
+        try:
+            return await send()
+        except UniFiRateLimitError as err:
+            self._defer_after_rate_limit(err.retry_after)
+            raise
 
     async def _request(
         self,
@@ -251,35 +297,18 @@ class BaseUniFiClient(ABC):
         """
         Make an HTTP request, retrying once after a short-lived 429.
 
-        Rate-limited APIs are paced by `_throttle`, so a 429 means another
-        consumer of the same API key drained the allowance. A rejected
-        request was not processed, so retrying it once after the server's
-        own Retry-After is safe for every method. A long or missing
-        Retry-After is raised to the caller unchanged.
+        See `_retry_once_after_rate_limit`.
 
         Raises:
             UniFiRateLimitError: If still rate limited after the retry, or the
                 server asks for a wait longer than RATE_LIMIT_MAX_RETRY_AFTER.
 
         """
-        try:
-            return await self._request_once(
+        return await self._retry_once_after_rate_limit(
+            lambda: self._request_once(
                 method, path, params=params, json_data=json_data, headers=headers
-            )
-        except UniFiRateLimitError as err:
-            retry_after = err.retry_after
-            if (
-                self._rate_limiter is None
-                or retry_after is None
-                or retry_after > RATE_LIMIT_MAX_RETRY_AFTER
-            ):
-                raise
-            _LOGGER.debug(
-                "Rate limited on %s %s, retrying in %ss", method, path, retry_after
-            )
-            self._defer_after_rate_limit(retry_after)
-        return await self._request_once(
-            method, path, params=params, json_data=json_data, headers=headers
+            ),
+            f"{method} {path}",
         )
 
     async def _request_once(

@@ -2199,33 +2199,91 @@ def _rate_limit_error(retry_after: int) -> UniFiRateLimitError:
     )
 
 
+def _response_context(
+    status: int, headers: dict[str, str], body: Any = None
+) -> MagicMock:
+    """An `async with session.request(...)` context yielding one response."""
+    response = MagicMock()
+    response.status = status
+    response.headers = headers
+    response.text = AsyncMock(
+        return_value="Too many requests" if status == 429 else "response body"
+    )
+    response.json = AsyncMock(return_value=body)
+    response.read = AsyncMock(return_value=b"jpeg")
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=None)
+    return context
+
+
+def _recording_session(
+    fake_clock: _FakeClock, contexts: list[MagicMock], method: str
+) -> tuple[MagicMock, list[float]]:
+    """A session whose `method` hands out `contexts` in turn, noting send times."""
+    send_times: list[float] = []
+
+    def send(*args: Any, **kwargs: Any) -> MagicMock:
+        send_times.append(fake_clock.now)
+        return contexts.pop(0)
+
+    session = MagicMock()
+    session.closed = False
+    setattr(session, method, MagicMock(side_effect=send))
+    return session, send_times
+
+
 async def test_request_retries_once_after_short_retry_after(
     fake_clock: _FakeClock,
 ) -> None:
-    """A 429 with a short Retry-After is waited out and retried once."""
+    """A 429 with a short Retry-After is waited out and retried once.
+
+    Both attempts go through the limiter, so the retry is only sent once the
+    Retry-After has passed.
+    """
     client = _protect_client()
-    client._request_once = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_rate_limit_error(1), {"ok": True}]
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(200, {}, {"ok": True}),
+        ],
+        "request",
     )
+    client._session = session
+    start = fake_clock.now
 
     assert await client._get("/cameras") == {"ok": True}
-    assert client._request_once.await_count == 2
-    assert client._rate_limiter is not None
-    assert client._rate_limiter._blocked_until == pytest.approx(fake_clock.now + 1)
+    assert session.request.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
 
 
 async def test_request_raises_when_retry_also_rate_limited(
     fake_clock: _FakeClock,
 ) -> None:
-    """Only one retry: a second 429 reaches the caller."""
+    """Only one retry: a second 429 reaches the caller, and defers the client.
+
+    Without the second defer, other queued requests would start against the
+    allowance the server has just rejected again.
+    """
     client = _protect_client()
-    client._request_once = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_rate_limit_error(1), _rate_limit_error(1)]
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(429, {"Retry-After": "1"}),
+        ],
+        "request",
     )
+    client._session = session
+    start = fake_clock.now
 
     with pytest.raises(UniFiRateLimitError):
         await client._get("/cameras")
-    assert client._request_once.await_count == 2
+    assert session.request.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(start + 2)
 
 
 async def test_request_does_not_retry_long_retry_after(
@@ -2241,6 +2299,11 @@ async def test_request_does_not_retry_long_retry_after(
         await client._get("/cameras")
     assert client._request_once.await_count == 1
     assert fake_clock.sleeps == []
+    # The client still backs off, capped so a long wait cannot freeze it.
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(
+        fake_clock.now + RATE_LIMIT_MAX_RETRY_AFTER
+    )
 
 
 async def test_unlimited_client_does_not_retry_429() -> None:
@@ -2273,46 +2336,68 @@ async def test_request_once_waits_for_rate_limiter(fake_clock: _FakeClock) -> No
 
 
 def _binary_session(status: int, headers: dict[str, str]) -> MagicMock:
-    response = MagicMock()
-    response.status = status
-    response.headers = headers
-    response.text = AsyncMock(return_value="Too many requests")
-    response.read = AsyncMock(return_value=b"jpeg")
-    context = MagicMock()
-    context.__aenter__ = AsyncMock(return_value=response)
-    context.__aexit__ = AsyncMock(return_value=None)
     session = MagicMock()
     session.closed = False
-    session.get = MagicMock(return_value=context)
+    session.get = MagicMock(
+        side_effect=lambda *args, **kwargs: _response_context(status, headers)
+    )
     return session
 
 
-async def test_binary_429_defers_whole_client(fake_clock: _FakeClock) -> None:
-    """A rate-limited snapshot makes every Protect request back off.
+async def test_binary_429_is_retried_once(fake_clock: _FakeClock) -> None:
+    """A rate-limited snapshot waits out a short Retry-After and is retried."""
+    client = _protect_client()
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(200, {}),
+        ],
+        "get",
+    )
+    client._session = session
+    start = fake_clock.now
+
+    assert await client._get_binary("/cameras/abc/snapshot") == b"jpeg"
+    assert session.get.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
+
+
+async def test_binary_429_on_retry_defers_whole_client(
+    fake_clock: _FakeClock,
+) -> None:
+    """A snapshot rate limited twice fails, and makes every request back off.
 
     Snapshots draw from the same per-key allowance as the JSON calls, so the
     back-off must apply to the whole client, not just the snapshot.
     """
     client = _protect_client()
     client._session = _binary_session(429, {"Retry-After": "1"})
+    start = fake_clock.now
 
     with pytest.raises(UniFiConnectionError):
         await client._get_binary("/cameras/abc/snapshot")
 
+    assert client._session.get.call_count == 2
     assert client._rate_limiter is not None
-    assert client._rate_limiter._blocked_until == pytest.approx(fake_clock.now + 1)
+    assert client._rate_limiter._blocked_until == pytest.approx(start + 2)
 
 
 async def test_binary_429_without_retry_after_defers_capped(
     fake_clock: _FakeClock,
 ) -> None:
-    """A missing Retry-After must not freeze the client for the 60 s default."""
+    """A missing Retry-After is not retried and must not freeze the client.
+
+    It defaults to 60 s, far past the retry cap, so the snapshot fails at
+    once and the client backs off only for the capped wait.
+    """
     client = _protect_client()
     client._session = _binary_session(429, {})
 
     with pytest.raises(UniFiConnectionError):
         await client._get_binary("/cameras/abc/snapshot")
 
+    assert client._session.get.call_count == 1
     assert client._rate_limiter is not None
     assert client._rate_limiter._blocked_until == pytest.approx(
         fake_clock.now + RATE_LIMIT_MAX_RETRY_AFTER

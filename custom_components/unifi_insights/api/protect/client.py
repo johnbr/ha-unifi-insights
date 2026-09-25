@@ -18,7 +18,11 @@ from ..const import (
     PROTECT_RATE_LIMIT_WINDOW,
     ConnectionType,
 )
-from ..exceptions import UniFiConnectionError, UniFiTimeoutError
+from ..exceptions import (
+    UniFiConnectionError,
+    UniFiRateLimitError,
+    UniFiTimeoutError,
+)
 from .endpoints import (
     AlarmHubsEndpoint,
     ApplicationEndpoint,
@@ -374,8 +378,38 @@ class UniFiProtectClient(BaseUniFiClient):
         Returns:
             Binary response data.
 
+        A 429 is waited out and retried once, like the JSON requests: see
+        `_retry_once_after_rate_limit`.
+
+        Raises:
+            UniFiConnectionError: If connection fails, or the request is
+                still rate limited after the retry.
+            UniFiTimeoutError: If request times out.
+
+        """
+        try:
+            return await self._retry_once_after_rate_limit(
+                lambda: self._get_binary_once(path, params=params),
+                f"GET {path}",
+            )
+        except UniFiRateLimitError as err:
+            msg = (
+                f"Failed to fetch binary data: {err.status_code} - {err.response_body}"
+            )
+            raise UniFiConnectionError(msg) from err
+
+    async def _get_binary_once(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        """
+        Make a single binary GET request.
+
         Raises:
             UniFiConnectionError: If connection fails.
+            UniFiRateLimitError: If rate limited.
             UniFiTimeoutError: If request times out.
 
         """
@@ -394,13 +428,17 @@ class UniFiProtectClient(BaseUniFiClient):
                 headers=headers,
             ) as response:
                 if response.status >= 400:
-                    if response.status == HTTPStatus.TOO_MANY_REQUESTS:
-                        # Snapshots share the JSON calls' allowance: make the
-                        # whole client back off, not just this request.
-                        self._defer_after_rate_limit(
-                            parse_retry_after(response.headers)
-                        )
                     text = await response.text()
+                    if response.status == HTTPStatus.TOO_MANY_REQUESTS:
+                        # Snapshots share the JSON calls' allowance, so the
+                        # caller's retry defers the whole client.
+                        msg = "Rate limited by API"
+                        raise UniFiRateLimitError(
+                            msg,
+                            status_code=response.status,
+                            response_body=text,
+                            retry_after=parse_retry_after(response.headers),
+                        )
                     raise UniFiConnectionError(
                         f"Failed to fetch binary data: {response.status} - {text}"
                     )
