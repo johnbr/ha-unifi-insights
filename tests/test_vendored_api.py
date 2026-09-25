@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -158,20 +158,21 @@ async def test_get_hosts_remote_without_console_id() -> None:
     client = UniFiNetworkClient(
         auth=ApiKeyAuth(api_key="test-key"),
         connection_type=ConnectionType.REMOTE,
+        session=MagicMock(),
     )
-    client._get = AsyncMock(
-        return_value={
-            "data": [
-                {
-                    "id": "console-id",
-                    "type": "console",
-                    "reportedState": {"hostname": "Dream Router 7"},
-                }
-            ]
+    hosts = [
+        {
+            "id": "console-id",
+            "type": "console",
+            "reportedState": {"hostname": "Dream Router 7"},
         }
-    )
-
-    result = await client.get_hosts()
+    ]
+    with patch(
+        "custom_components.unifi_insights.api.network.client.UniFiSiteManagerClient"
+    ) as site_manager_class:
+        site_manager_class.return_value.list_hosts = AsyncMock(return_value=hosts)
+        result = await client.get_hosts()
+        site_manager_class.return_value.list_hosts.assert_awaited_once()
 
     assert result == [
         {
@@ -180,7 +181,7 @@ async def test_get_hosts_remote_without_console_id() -> None:
             "reportedState": {"hostname": "Dream Router 7"},
         }
     ]
-    client._get.assert_awaited_once_with("/v1/hosts")
+    site_manager_class.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -2178,14 +2179,12 @@ async def test_rate_limiter_defer_holds_requests(fake_clock: _FakeClock) -> None
     [
         ({"Retry-After": "1"}, 1),
         ({}, DEFAULT_RATE_LIMIT_RETRY_AFTER),
-        (
-            {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
-            DEFAULT_RATE_LIMIT_RETRY_AFTER,
-        ),
+        ({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}, 0),
+        ({"Retry-After": "invalid"}, DEFAULT_RATE_LIMIT_RETRY_AFTER),
     ],
 )
 def test_parse_retry_after(headers: dict[str, str], expected: int) -> None:
-    """Retry-After is read as seconds; anything else falls back to the default.
+    """Retry-After parses seconds or HTTP dates; invalid headers fall back to default.
 
     An HTTP-date Retry-After (allowed by RFC 9110) used to raise ValueError
     out of the response handler instead of a UniFiRateLimitError.

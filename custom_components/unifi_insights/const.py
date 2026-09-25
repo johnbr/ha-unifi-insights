@@ -62,6 +62,24 @@ DEFAULT_API_HOST = "https://192.168.10.1"
 SCAN_INTERVAL_DEVICE = timedelta(seconds=30)
 # Config coordinator - slow updates for sites, WiFi config (5 minutes)
 SCAN_INTERVAL_CONFIG = timedelta(minutes=5)
+SCAN_INTERVAL_SITE_MANAGER = timedelta(minutes=10)
+# Site Manager response sections shared by the coordinator and diagnostics.
+SITE_MANAGER_COLLECTIONS: Final = (
+    "hosts",
+    "sites",
+    "devices",
+    "isp_metrics",
+    "sd_wan_configs",
+)
+ISP_WAN_NUMBERS: Final = (
+    "avgLatency",
+    "download_kbps",
+    "downtime",
+    "maxLatency",
+    "packetLoss",
+    "upload_kbps",
+    "uptime",
+)
 # Protect coordinator - moderate updates for cameras, sensors (30 seconds)
 # Real-time updates via WebSocket when available
 SCAN_INTERVAL_PROTECT = timedelta(seconds=30)

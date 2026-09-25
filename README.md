@@ -105,6 +105,14 @@ This project overlaps with and complements Home Assistant's official integration
 4. For a local connection, enter the host URL (for example `https://192.168.1.1`) and your API key.
 5. Click **Submit**.
 
+Remote entries also use the same API key to refresh Site Manager host, site, and
+device inventory, five-minute ISP metrics, and SD-WAN configuration types every
+10 minutes. Entries using the same key share one account refresh. This data is
+available in the integration's coordinator and as a limited summary in the
+downloadable diagnostics report; it does not create additional entities. A Site
+Manager error does not stop the console connection, and collection availability
+is shown in diagnostics.
+
 ### Options
 
 After setup, open the integration's options flow (**Settings** → **Devices & Services** → **UniFi Insights** → **Configure**) to adjust these settings:

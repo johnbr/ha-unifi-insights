@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -44,6 +45,39 @@ async def test_diagnostics(
     assert "test_api_key" not in str(diagnostics)
     # The key name "api_key" will appear, but the value should be redacted
     assert diagnostics["entry"]["data"]["api_key"] == "**REDACTED**"
+
+
+async def test_site_manager_diagnostics_exclude_raw_cloud_snapshot(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Account-wide Site Manager records never pass through generic redaction."""
+    snapshot = {
+        "hosts": {
+            "secret-host": {
+                "id": "secret-host",
+                "reportedState": {"hostname": "private.example.test"},
+            }
+        },
+        "sites": {},
+        "devices": {},
+        "isp_metrics": {},
+        "sd_wan_configs": {},
+        "collections": {},
+        "last_attempt": None,
+        "cooldown_until": None,
+    }
+    runtime = init_integration.runtime_data
+    runtime.site_manager_coordinator = SimpleNamespace(data=snapshot)
+    runtime.coordinator.data["site_manager"] = snapshot
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    assert diagnostics["site_manager"]["inventory"]["hosts"] == 1
+    assert "site_manager" not in diagnostics["data"]
+    assert "secret-host" not in repr(diagnostics)
+    assert "private.example.test" not in repr(diagnostics)
 
 
 async def test_diagnostics_includes_websocket_health(

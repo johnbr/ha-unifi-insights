@@ -19,12 +19,13 @@ if TYPE_CHECKING:
     from .config import UnifiConfigCoordinator
     from .device import UnifiDeviceCoordinator
     from .protect import UnifiProtectCoordinator
+    from .site_manager import UnifiInsightsSiteManagerCoordinator
 
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.const import CONF_CONSOLE_ID, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config_coordinator: UnifiConfigCoordinator,
         device_coordinator: UnifiDeviceCoordinator,
         protect_coordinator: UnifiProtectCoordinator | None,
+        *,
+        site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None,
     ) -> None:
         """Initialize the facade coordinator."""
         super().__init__(
@@ -74,6 +77,8 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._config_coordinator = config_coordinator
         self._device_coordinator = device_coordinator
         self._protect_coordinator = protect_coordinator
+        self._site_manager_coordinator = site_manager_coordinator
+        self._site_manager_host_id = entry.data.get(CONF_CONSOLE_ID)
 
         # Remove-callbacks returned by async_add_listener() below, released
         # in async_shutdown() so this facade's forwarding listener doesn't
@@ -104,6 +109,12 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._protect_coordinator:
             self._sub_coordinator_unsubs.append(
                 self._protect_coordinator.async_add_listener(
+                    self._handle_coordinator_update
+                )
+            )
+        if self._site_manager_coordinator:
+            self._sub_coordinator_unsubs.append(
+                self._site_manager_coordinator.async_add_listener(
                     self._handle_coordinator_update
                 )
             )
@@ -181,6 +192,16 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Combined timestamp
             "last_update": datetime.now(tz=UTC),
         }
+        if self._site_manager_coordinator:
+            account_data = self._site_manager_coordinator.data
+            self.data["site_manager"] = {
+                **account_data,
+                "selected_host_id": (
+                    self._site_manager_host_id
+                    if self._site_manager_host_id in account_data["hosts"]
+                    else None
+                ),
+            }
 
     def get_site(self, site_id: str) -> dict[str, Any] | None:
         """Get site data by site ID (delegates to config coordinator)."""

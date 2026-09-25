@@ -43,7 +43,12 @@ from .coordinators import (
     UnifiConfigCoordinator,
     UnifiDeviceCoordinator,
     UnifiFacadeCoordinator,
+    UnifiInsightsSiteManagerCoordinator,
     UnifiProtectCoordinator,
+)
+from .coordinators.site_manager import (
+    async_acquire_site_manager,
+    async_release_site_manager,
 )
 from .probe import (
     ProbeResult,
@@ -69,6 +74,8 @@ class UnifiInsightsData:
     protect_coordinator: UnifiProtectCoordinator | None
     network_client: UniFiNetworkClient
     protect_client: UniFiProtectClient | None
+    site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None
+    site_manager_fingerprint: str | None = None
     # Facade coordinator for backward compatibility with entity classes
     _facade_coordinator: UnifiFacadeCoordinator | None = None
 
@@ -486,35 +493,47 @@ async def async_setup_entry(
         await protect_coordinator.async_start_websocket()
         entry.async_on_unload(protect_coordinator.async_stop_websocket)
 
-    # Create facade coordinator for backward compatibility with entity classes
-    # (it aggregates the initial data from the sub-coordinators on creation)
-    _LOGGER.debug("Creating facade coordinator for backward compatibility")
-    facade_coordinator = UnifiFacadeCoordinator(
-        hass=hass,
-        network_client=network_client,
-        protect_client=protect_client,
-        entry=entry,
-        config_coordinator=config_coordinator,
-        device_coordinator=device_coordinator,
-        protect_coordinator=protect_coordinator,
-    )
+    site_manager_fingerprint: str | None = None
+    site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None
+    if not is_local:
+        site_manager_fingerprint, account = await async_acquire_site_manager(
+            hass, entry.data[CONF_API_KEY], entry.entry_id, websession
+        )
+        site_manager_coordinator = account.coordinator
 
-    # Store runtime data in config entry (Gold requirement)
-    entry.runtime_data = UnifiInsightsData(
-        config_coordinator=config_coordinator,
-        device_coordinator=device_coordinator,
-        protect_coordinator=protect_coordinator,
-        network_client=network_client,
-        protect_client=protect_client,
-        _facade_coordinator=facade_coordinator,
-    )
+    try:
+        # The facade aggregates the optional account snapshot separately.
+        facade_coordinator = UnifiFacadeCoordinator(
+            hass=hass,
+            network_client=network_client,
+            protect_client=protect_client,
+            entry=entry,
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=protect_coordinator,
+            site_manager_coordinator=site_manager_coordinator,
+        )
 
-    # Set up platforms
-    _LOGGER.debug("Setting up platforms: %s", PLATFORMS)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        entry.runtime_data = UnifiInsightsData(
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=protect_coordinator,
+            network_client=network_client,
+            protect_client=protect_client,
+            site_manager_coordinator=site_manager_coordinator,
+            site_manager_fingerprint=site_manager_fingerprint,
+            _facade_coordinator=facade_coordinator,
+        )
 
-    # Reload entry when its updated
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+        _LOGGER.debug("Setting up platforms: %s", PLATFORMS)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    except BaseException:
+        if site_manager_fingerprint:
+            await async_release_site_manager(
+                hass, site_manager_fingerprint, entry.entry_id
+            )
+        raise
 
     _LOGGER.info("UniFi Insights integration setup completed successfully")
     return True
@@ -559,6 +578,11 @@ async def async_unload_entry(
                 await data.network_client.close()
             except Exception as err:
                 _LOGGER.debug("Error closing Network client: %s", err)
+
+        if data.site_manager_fingerprint:
+            await async_release_site_manager(
+                hass, data.site_manager_fingerprint, entry.entry_id
+            )
 
     return unload_ok
 

@@ -7,11 +7,13 @@ from .config import UnifiConfigCoordinator
 from .device import UnifiDeviceCoordinator
 from .facade import UnifiFacadeCoordinator
 from .protect import UnifiProtectCoordinator
+from .site_manager import UnifiInsightsSiteManagerCoordinator
 
 __all__ = [
     "UnifiBaseCoordinator",
     "UnifiConfigCoordinator",
     "UnifiDeviceCoordinator",
     "UnifiFacadeCoordinator",
+    "UnifiInsightsSiteManagerCoordinator",
     "UnifiProtectCoordinator",
 ]

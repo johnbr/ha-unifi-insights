@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 
 from .api import __version__ as api_version
-from .const import CONF_CONSOLE_ID
+from .const import CONF_CONSOLE_ID, ISP_WAN_NUMBERS, SITE_MANAGER_COLLECTIONS
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -19,7 +20,8 @@ if TYPE_CHECKING:
     from . import UnifiInsightsConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
-
+_MAX_HOST_SITE_COUNTS = 20
+_MAX_ISP_SAMPLES = 8
 TO_REDACT = {
     # Credentials and secrets
     CONF_API_KEY,
@@ -255,6 +257,95 @@ def _redact_coordinator_data(data: Any) -> Any:
     return redacted
 
 
+def _site_manager_summary(
+    snapshot: Mapping[str, Any], console_id: str
+) -> dict[str, Any]:
+    """Build a bounded diagnostic view without cloud identifiers or raw data."""
+    hosts = snapshot.get("hosts") or {}
+    sites = snapshot.get("sites") or {}
+    devices = snapshot.get("devices") or {}
+    metrics = snapshot.get("isp_metrics") or {}
+    configs = snapshot.get("sd_wan_configs") or {}
+    collections = snapshot.get("collections") or {}
+
+    site_counts: dict[str, int] = {}
+    for site in sites.values():
+        host_id = site.get("hostId") if isinstance(site, Mapping) else None
+        if isinstance(host_id, str):
+            site_counts[host_id] = site_counts.get(host_id, 0) + 1
+
+    selected_devices = devices.get(console_id) or {}
+    selected_device_count = len(selected_devices.get("devices") or [])
+    selected_metrics = metrics.get(console_id) or {}
+    samples: list[dict[str, Any]] = []
+    for item in selected_metrics.values():
+        if not isinstance(item, Mapping):
+            continue
+        metric_time = item.get("metric_time")
+        wan = item.get("wan")
+        if not isinstance(metric_time, str) or not isinstance(wan, Mapping):
+            continue
+        try:
+            safe_time = datetime.fromisoformat(metric_time).isoformat()
+        except ValueError:
+            continue
+        samples.append(
+            {
+                "metric_time": safe_time,
+                "wan": {
+                    key: value
+                    for key in ISP_WAN_NUMBERS
+                    if isinstance(value := wan.get(key), (int, float))
+                    and not isinstance(value, bool)
+                },
+            }
+        )
+    samples.sort(key=lambda item: str(item["metric_time"]), reverse=True)
+
+    sd_wan_types: dict[str, int] = {}
+    for config in configs.values():
+        config_type = config.get("type") if isinstance(config, Mapping) else None
+        safe_type = "sdwan-hbsp" if config_type == "sdwan-hbsp" else "other"
+        sd_wan_types[safe_type] = sd_wan_types.get(safe_type, 0) + 1
+
+    return {
+        "inventory": {
+            "hosts": len(hosts),
+            "sites": len(sites),
+            "device_groups": len(devices),
+            "devices": sum(
+                len(group.get("devices") or [])
+                for group in devices.values()
+                if isinstance(group, Mapping)
+            ),
+            "sd_wan_configs": len(configs),
+        },
+        "host_site_counts": sorted(site_counts.values(), reverse=True)[
+            :_MAX_HOST_SITE_COUNTS
+        ],
+        "host_site_counts_truncated": len(site_counts) > _MAX_HOST_SITE_COUNTS,
+        "selected_host": {
+            "found": console_id in hosts,
+            "site_count": site_counts.get(console_id, 0),
+            "device_count": selected_device_count,
+            "isp_samples": samples[:_MAX_ISP_SAMPLES],
+            "isp_samples_truncated": len(samples) > _MAX_ISP_SAMPLES,
+        },
+        "sd_wan_types": sd_wan_types,
+        "collections": {
+            name: {
+                "available": bool(state.get("available")),
+                "updated_at": state.get("updated_at"),
+                "error": state.get("error"),
+            }
+            for name in SITE_MANAGER_COLLECTIONS
+            if isinstance(state := collections.get(name), Mapping)
+        },
+        "last_attempt": snapshot.get("last_attempt"),
+        "cooldown_until": snapshot.get("cooldown_until"),
+    }
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: UnifiInsightsConfigEntry
 ) -> dict[str, Any]:
@@ -283,14 +374,22 @@ async def async_get_config_entry_diagnostics(
         protect_coordinator.websocket_health if protect_coordinator else None
     )
 
-    # Get the raw data but remove sensitive information
+    # The Site Manager snapshot contains account-wide identifiers and variable
+    # nested fields. Build its summary separately and exclude the raw section.
+    facade_data = dict(coordinator.data)
+    facade_data.pop("site_manager", None)
     diagnostics_data: dict[str, Any] = {
         "library_version": library_version,
         "connection": connection_info,
         "websocket": websocket_info,
         "entry": async_redact_data(entry.as_dict(), TO_REDACT),
-        "data": _redact_coordinator_data(coordinator.data),
+        "data": _redact_coordinator_data(facade_data),
     }
+    if data.site_manager_coordinator:
+        diagnostics_data["site_manager"] = _site_manager_summary(
+            data.site_manager_coordinator.data,
+            entry.data.get(CONF_CONSOLE_ID, ""),
+        )
 
     # Last pass over the assembled payload: no MAC address leaves this
     # integration, whatever key the controller sent it under.
